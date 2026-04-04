@@ -7,6 +7,7 @@ sys.path.append("/dockerx/bangzhli/projects/LVR-Finetune")
 
 import torch
 import torch.nn.functional as F
+import math
 from typing import Optional, Tuple
 
 import warnings
@@ -266,8 +267,6 @@ def nanmax(tensor: torch.Tensor) -> torch.Tensor:
     if torch.isnan(tensor).all():
         return torch.tensor(float("nan"), dtype=tensor.dtype, device=tensor.device)
     return torch.max(tensor[~torch.isnan(tensor)])
-
-
 class QwenGRPOTrainer(Trainer):
     def __init__(
         self,
@@ -309,6 +308,11 @@ class QwenGRPOTrainer(Trainer):
 
         # Reference model
         self.beta = args.beta
+        self.sigma = args.sigma
+        self.use_beta_hat = args.use_beta_hat
+        self.t_max = args.t_max
+        if self.use_beta_hat and self.t_max <= 0:
+            raise ValueError("`t_max` must be a positive integer when `use_beta_hat=True`.")
         self.ref_model_pth = ref_model_pth
         if self.beta == 0.0:
             # If beta is 0.0, the reference model is not needed
@@ -352,6 +356,12 @@ class QwenGRPOTrainer(Trainer):
             else:
                 self.reward_func_names.append(reward_funcs[i].__name__)
         self.reward_funcs = reward_funcs
+        try:
+            self.accuracy_reward_idx = self.reward_func_names.index("accuracy_reward")
+        except ValueError as exc:
+            raise ValueError(
+                "RLVR objective scheme C requires a reward function named `accuracy_reward`."
+            ) from exc
 
         # Reward weights
         if args.reward_weights is not None:
@@ -675,6 +685,19 @@ class QwenGRPOTrainer(Trainer):
 
         return logps
 
+    def _compute_alpha_hat(self, grouped_accuracy_rewards: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        mean_accuracy_reward = grouped_accuracy_rewards.mean(dim=1)
+        alpha_hat = self.sigma * mean_accuracy_reward * (1.0 - mean_accuracy_reward)
+        return mean_accuracy_reward, alpha_hat
+
+    def _get_kl_coeff(self) -> tuple[float, int]:
+        t_cur = min(self.state.global_step, self.t_max) if self.use_beta_hat else self.state.global_step
+        if not self.use_beta_hat:
+            return self.beta, t_cur
+        progress = t_cur / self.t_max
+        beta_hat = 0.5 * self.beta * (1.0 + math.cos(math.pi * progress))
+        return beta_hat, t_cur
+
     def _prepare_inputs(self, inputs):
         # Simple pass-through, just like original
         return inputs
@@ -871,6 +894,9 @@ class QwenGRPOTrainer(Trainer):
 
         # Apply weights to each reward function's output and sum
         rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
+        accuracy_rewards = rewards_per_func[:, self.accuracy_reward_idx]
+        grouped_accuracy_rewards = accuracy_rewards.view(-1, self.num_generations)
+        mean_accuracy_reward, alpha_hat = self._compute_alpha_hat(grouped_accuracy_rewards)
 
         # Compute grouped-wise rewards
         mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
@@ -879,6 +905,7 @@ class QwenGRPOTrainer(Trainer):
         # Normalize the rewards to compute the advantages
         mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
         std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
+        alpha_hat_per_sample = alpha_hat.repeat_interleave(self.num_generations, dim=0)
         advantages = rewards - mean_grouped_rewards
         if self.scale_rewards:
             advantages = advantages / (std_grouped_rewards + 1e-4)
@@ -889,6 +916,7 @@ class QwenGRPOTrainer(Trainer):
             (self.accelerator.process_index + 1) * len(prompts),
         )
         advantages = advantages[process_slice]
+        alpha_hat_per_sample = alpha_hat_per_sample[process_slice]
 
         # Log the metrics
         if mode == "train":
@@ -919,6 +947,11 @@ class QwenGRPOTrainer(Trainer):
             self._metrics[mode][f"rewards/{reward_func_name}/mean"].append(mean_rewards)
             std_rewards = nanstd(rewards_per_func[:, i]).item()
             self._metrics[mode][f"rewards/{reward_func_name}/std"].append(std_rewards)
+        self._metrics[mode]["mean_accuracy_reward"].append(torch.nanmean(mean_accuracy_reward).item())
+        self._metrics[mode]["alpha_hat"].append(torch.nanmean(alpha_hat).item())
+        self._metrics[mode]["beta"].append(float(self.beta))
+        self._metrics[mode]["use_beta_hat"].append(float(self.use_beta_hat))
+        self._metrics[mode]["T_max"].append(float(self.t_max))
         self._metrics[mode]["reward"].append(mean_grouped_rewards.mean().item())
         self._metrics[mode]["reward_std"].append(std_grouped_rewards.mean().item())
 
@@ -935,6 +968,7 @@ class QwenGRPOTrainer(Trainer):
             "completion_mask": completion_mask,
             "final_mask": final_mask[:, -logits_to_keep:],  ### return this for later loss computation
             "advantages": advantages,
+            "alpha_hat": alpha_hat_per_sample,
             "old_per_token_logps": old_per_token_logps,
             "ref_per_token_logps": ref_per_token_logps,
             "multimodal_inputs": multimodal_inputs,
@@ -969,6 +1003,7 @@ class QwenGRPOTrainer(Trainer):
         old_per_token_logps = inputs["old_per_token_logps"]
         ref_per_token_logps = inputs["ref_per_token_logps"]
         advantages = inputs["advantages"]
+        alpha_hat = inputs["alpha_hat"]
 
         device = prompt_ids.device
         batch_size = prompt_ids.size(0)
@@ -1057,22 +1092,26 @@ class QwenGRPOTrainer(Trainer):
 
         # Expand advantages across tokens
         adv = advantages.to(device).unsqueeze(1)
+        alpha = alpha_hat.to(device).unsqueeze(1)
 
         coef_1 = torch.exp(per_token_logps - old_logps)
         coef_2 = torch.clamp(coef_1, 1 - self.epsilon_low, 1 + self.epsilon_high)
 
-        per_token_loss1 = coef_1 * adv
-        per_token_loss2 = coef_2 * adv
-        per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
+        per_token_policy_obj = torch.min(coef_1 * adv, coef_2 * adv)
+        per_token_policy_loss = -(alpha * per_token_policy_obj)
+        per_token_loss = per_token_policy_loss
 
         # ----------------------------------------------------
         # 4) KL penalty if beta > 0
+        kl_coeff, t_cur = self._get_kl_coeff()
         if self.beta != 0.0 and ref_per_token_logps is not None:
             ref_logps = ref_per_token_logps * final_mask
             per_token_kl = torch.exp(ref_logps - per_token_logps) - (ref_logps - per_token_logps) - 1
-            per_token_loss = per_token_loss + self.beta * per_token_kl
+            per_token_kl_loss = kl_coeff * per_token_kl
+            per_token_loss = per_token_loss + per_token_kl_loss
         else:
             per_token_kl = None
+            per_token_kl_loss = torch.zeros_like(per_token_loss)
 
 
         # ----------------------------------------------------
@@ -1117,6 +1156,14 @@ class QwenGRPOTrainer(Trainer):
 
         # Log the metrics
         mode = "eval" if self.control.should_evaluate else "train"
+
+        policy_loss = ((per_token_policy_loss * final_mask).sum(-1) / final_mask.sum(-1).clamp(min=1.0)).mean()
+        kl_loss = ((per_token_kl_loss * final_mask).sum(-1) / final_mask.sum(-1).clamp(min=1.0)).mean()
+        self._metrics[mode]["policy_loss"].append(self.accelerator.gather_for_metrics(policy_loss.detach()).nanmean().item())
+        self._metrics[mode]["kl_loss"].append(self.accelerator.gather_for_metrics(kl_loss.detach()).nanmean().item())
+        self._metrics[mode]["total_loss"].append(self.accelerator.gather_for_metrics(loss.detach()).nanmean().item())
+        self._metrics[mode]["T_cur"].append(float(t_cur))
+        self._metrics[mode]["beta_hat"].append(float(kl_coeff) if self.use_beta_hat else float(self.beta))
 
         # if self.beta != 0.0:
         #     mean_kl = (per_token_kl * completion_mask).sum() / completion_mask.sum()

@@ -127,6 +127,18 @@ class GRPOArguments(GRPOConfigTRL):
             "training speed, but may be numerically unstable for long training runs."
         },
     )
+    sigma: float = field(
+        default=7.2,
+        metadata={"help": "Scaling factor used to compute alpha_hat from grouped accuracy_reward."},
+    )
+    use_beta_hat: bool = field(
+        default=False,
+        metadata={"help": "Whether to replace the fixed KL coefficient beta with cosine-annealed beta_hat."},
+    )
+    t_max: int = field(
+        default=1000,
+        metadata={"help": "Positive annealing horizon used by beta_hat when use_beta_hat=True."},
+    )
     temperature: float = 1.0
     top_p: float = 1.0
     top_k: int = 50
