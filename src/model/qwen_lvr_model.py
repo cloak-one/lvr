@@ -97,6 +97,32 @@ class QwenWithLVR(Qwen2_5_VLForConditionalGeneration):
         #     fill_value=1.0 / self.config.hidden_size
         # )
         # self.register_buffer('lvr_latent_end_emb', lvr_latent_end_emb)    # will not compute grad
+
+    def _append_mm_token_type_ids_for_generation(
+        self,
+        model_kwargs: dict,
+        next_tokens: torch.Tensor,
+    ) -> dict:
+        mm_token_type_ids = model_kwargs.get("mm_token_type_ids")
+        if mm_token_type_ids is None:
+            return model_kwargs
+
+        if mm_token_type_ids.ndim != 2:
+            return model_kwargs
+
+        if mm_token_type_ids.size(0) != next_tokens.size(0):
+            return model_kwargs
+
+        # Generated completion tokens are text tokens, so append token type 0.
+        next_mm_token_type_ids = torch.zeros(
+            (next_tokens.size(0), 1),
+            dtype=mm_token_type_ids.dtype,
+            device=mm_token_type_ids.device,
+        )
+        model_kwargs["mm_token_type_ids"] = torch.cat(
+            [mm_token_type_ids, next_mm_token_type_ids], dim=1
+        )
+        return model_kwargs
     
     # Patch the generation function with lvr_generate
     def generate(
@@ -560,6 +586,7 @@ class QwenWithLVR(Qwen2_5_VLForConditionalGeneration):
 
                 # update generated ids, model inputs, and length for next step
                 input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
+                model_kwargs = self._append_mm_token_type_ids_for_generation(model_kwargs, next_tokens)
                 if streamer is not None:
                     streamer.put(next_tokens.cpu())
                     
@@ -830,6 +857,7 @@ class QwenWithLVR(Qwen2_5_VLForConditionalGeneration):
 
                 # update generated ids, model inputs, and length for next step
                 input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
+                model_kwargs = self._append_mm_token_type_ids_for_generation(model_kwargs, next_tokens)
                 if streamer is not None:
                     streamer.put(next_tokens.cpu())
 
@@ -1073,6 +1101,7 @@ class QwenWithLVR(Qwen2_5_VLForConditionalGeneration):
 
             # update generated ids, model inputs, and length for next step
             input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
+            model_kwargs = self._append_mm_token_type_ids_for_generation(model_kwargs, next_tokens)
             if streamer is not None:
                 streamer.put(next_tokens.cpu())
 
