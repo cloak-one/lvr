@@ -4,7 +4,7 @@ import torch.nn as nn
 
 import sys
 
-sys.path.append("/dockerx/bangzhli/projects/LVR-Finetune/src")
+sys.path.append("/root/lvr/src")
 
 from transformers import Trainer
 from transformers.trainer import (

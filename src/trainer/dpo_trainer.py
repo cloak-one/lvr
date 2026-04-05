@@ -1,6 +1,6 @@
 import sys
 import os
-sys.path.append("/dockerx/bangzhli/projects/LVR-Finetune/src")
+sys.path.append("/root/lvr/src")
 
 import os
 import torch

@@ -104,6 +104,7 @@ def qwen2_5_mixed_modality_forward_lvr_grpo(
     image_grid_thw: Optional[torch.LongTensor] = None,
     video_grid_thw: Optional[torch.LongTensor] = None,
     rope_deltas: Optional[torch.LongTensor] = None,
+    mm_token_type_ids: Optional[torch.IntTensor] = None,
     cache_position: Optional[torch.LongTensor] = None,
     second_per_grid_ts: Optional[torch.Tensor] = None,
     lvr_mode_switch: Optional[torch.Tensor] = None, # This is for GENERATION: Which instance in the batch is in lvr mode
@@ -149,8 +150,9 @@ def qwen2_5_mixed_modality_forward_lvr_grpo(
         # image_embeds = torch.cat(image_embeds, dim=0)
 
         # older Transformers
-        pixel_values = pixel_values.type(self.visual.dtype)
-        image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+        vision_tower = self.model.visual if hasattr(self, "model") and hasattr(self.model, "visual") else self.visual
+        pixel_values = pixel_values.type(vision_tower.dtype)
+        image_embeds = vision_tower(pixel_values, grid_thw=image_grid_thw)
 
 
         n_image_tokens = (input_ids == self.config.image_token_id).sum().item()
@@ -184,17 +186,25 @@ def qwen2_5_mixed_modality_forward_lvr_grpo(
         attention_mask = attention_mask.to(inputs_embeds.device)
 
     # if we get 4D attention mask we cannot calculate rope deltas anymore. TODO @raushan fixme
+    rope_state_holder = self.model if hasattr(self, "model") and hasattr(self.model, "rope_deltas") else self
+
     if position_ids is None and (attention_mask is None or attention_mask.ndim == 2):
         # calculate RoPE index once per generation in the pre-fill stage only
-        if (cache_position is not None and cache_position[0] == 0) or self.rope_deltas is None:
-            position_ids, rope_deltas = self.get_rope_index(
-                input_ids, image_grid_thw, video_grid_thw, attention_mask
+        if (cache_position is not None and cache_position[0] == 0) or rope_state_holder.rope_deltas is None:
+            rope_index_fn = self.model.get_rope_index if hasattr(self, "model") and hasattr(self.model, "get_rope_index") else self.get_rope_index
+            position_ids, rope_deltas = rope_index_fn(
+                input_ids,
+                mm_token_type_ids=mm_token_type_ids,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                second_per_grid_ts=second_per_grid_ts,
+                attention_mask=attention_mask,
             )
-            self.rope_deltas = rope_deltas
+            rope_state_holder.rope_deltas = rope_deltas
         # then use the prev pre-calculated rope-deltas to get the correct position ids
         else:
             batch_size, seq_length, _ = inputs_embeds.shape
-            delta = cache_position[0] + self.rope_deltas if cache_position is not None else 0
+            delta = cache_position[0] + rope_state_holder.rope_deltas if cache_position is not None else 0
             position_ids = torch.arange(seq_length, device=inputs_embeds.device)
             position_ids = position_ids.view(1, -1).expand(batch_size, -1)
             if cache_position is not None:  # otherwise `deltas` is an int `0`
@@ -213,6 +223,8 @@ def qwen2_5_mixed_modality_forward_lvr_grpo(
         output_hidden_states=output_hidden_states,
         return_dict=return_dict,
         cache_position=cache_position,
+        mm_token_type_ids=mm_token_type_ids,
+        second_per_grid_ts=second_per_grid_ts,
     )
 
     # check if there is lvr_head
@@ -261,6 +273,6 @@ def qwen2_5_mixed_modality_forward_lvr_grpo(
         past_key_values=outputs.past_key_values,
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,
-        rope_deltas=self.rope_deltas,
+        rope_deltas=(self.model.rope_deltas if hasattr(self, "model") and hasattr(self.model, "rope_deltas") else None),
         last_position_hidden_state =last_position_hidden_state
     )

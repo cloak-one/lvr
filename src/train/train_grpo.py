@@ -29,15 +29,23 @@ def set_requires_grad(parameters, requires_grad):
     for p in parameters:
         p.requires_grad = requires_grad
 
+
+def get_vision_tower(model):
+    if hasattr(model, "visual"):
+        return model.visual
+    if hasattr(model, "model") and hasattr(model.model, "visual"):
+        return model.model.visual
+    raise AttributeError("Unable to locate the vision tower on the loaded model.")
+
 def configure_vision_tower(model, training_args, compute_dtype, device):
-    vision_tower = model.visual
+    vision_tower = get_vision_tower(model)
     vision_tower.to(dtype=compute_dtype, device=device)
 
-    vision_model_params = model.visual.parameters()
+    vision_model_params = vision_tower.parameters()
     set_requires_grad(vision_model_params, not training_args.freeze_vision_tower)
     
     # Handle merger specifically
-    merger_params = model.visual.merger.parameters()
+    merger_params = vision_tower.merger.parameters()
     set_requires_grad(merger_params, not training_args.freeze_merger)
 
 def configure_llm(model, training_args):
@@ -49,6 +57,13 @@ def configure_llm(model, training_args):
 
 import torch.distributed as dist
 from torch.distributed import get_rank, barrier
+
+
+def resolve_cache_root(training_args):
+    cache_root = training_args.cache_dir or os.getenv("CACHE_DIR")
+    if cache_root:
+        return cache_root
+    return os.path.join(pathlib.Path.home(), ".cache", "lvr")
 
 def download_checkpoint_if_needed(remote_path, local_path, oci_handler):
     rank = get_rank() if dist.is_initialized() else 0
@@ -94,21 +109,36 @@ def train():
         bucket_name = os.environ.get('BUCKET_NAME')
         region_name = os.environ.get('REGION_NAME')
 
-        model_name = model_args.model_id.split('/')[-1]     # "Qwen2.5-VL-7B-Instruct"
-        # local cache dir and tempFile class
-        cache_dir = os.getenv("CACHE_DIR")  #cache dir = "/dockerx/Local/users/bangzheng"
-        # temp_file class; "/dockerx/Local/users/bangzheng/model_name/run_name-[random]"
-        local_model_name_or_path = create_temp_dir(base_path=os.path.join(cache_dir,model_name),prefix=training_args.run_name + '-')     
-        temp_folder = local_model_name_or_path
+        oci_env_ready = all([access_key_id, secret_access_key, endpoint_url, bucket_name, region_name])
+        if not oci_env_ready:
+            if training_args.checkpoint_name and os.path.exists(training_args.checkpoint_name):
+                rank0_print(
+                    "OCI checkpoint environment is incomplete; falling back to the local checkpoint path "
+                    f"{training_args.checkpoint_name}."
+                )
+                training_args.online_checkpoint = False
+            else:
+                raise ValueError(
+                    "online_checkpoint=True requires ACCESS_KEY_ID, SECRET_ACCESS_KEY, ENDPOINT_URL, "
+                    "BUCKET_NAME, and REGION_NAME, or a local checkpoint_name path that exists."
+                )
 
-        # remote dir
-        remote_dir = training_args.output_dir  # output_dir is remote now; "/checkpoints"
-        remote_dir = os.path.join(remote_dir,model_name,training_args.run_name)    # "/checkpoints/Qwen2.5-VL-7B-Instruct/run_name"
-        training_args.remote_output_dir = remote_dir
-        training_args.output_dir = local_model_name_or_path.name    # output_dir should always be local
+        if training_args.online_checkpoint:
+            model_name = model_args.model_id.split('/')[-1]     # "Qwen2.5-VL-7B-Instruct"
+            # local cache dir and tempFile class
+            cache_dir = resolve_cache_root(training_args)  # fallback to a writable local cache if unset
+            # temp_file class; "/dockerx/Local/users/bangzheng/model_name/run_name-[random]"
+            local_model_name_or_path = create_temp_dir(base_path=os.path.join(cache_dir,model_name),prefix=training_args.run_name + '-')     
+            temp_folder = local_model_name_or_path
 
-        # oci handler
-        oci_handler = OCIFolderCheckpointHandler(access_key_id, secret_access_key, endpoint_url, bucket_name, region_name)
+            # remote dir
+            remote_dir = training_args.output_dir  # output_dir is remote now; "/checkpoints"
+            remote_dir = os.path.join(remote_dir,model_name,training_args.run_name)    # "/checkpoints/Qwen2.5-VL-7B-Instruct/run_name"
+            training_args.remote_output_dir = remote_dir
+            training_args.output_dir = local_model_name_or_path.name    # output_dir should always be local
+
+            # oci handler
+            oci_handler = OCIFolderCheckpointHandler(access_key_id, secret_access_key, endpoint_url, bucket_name, region_name)
 
     local_rank = training_args.local_rank
 
@@ -212,7 +242,7 @@ def train():
         return output
     # depends on the version of huggingface
     # model.model.visual.patch_embed.register_forward_hook(output_nan_sanitizer_hook)
-    model.visual.patch_embed.register_forward_hook(output_nan_sanitizer_hook)
+    get_vision_tower(model).patch_embed.register_forward_hook(output_nan_sanitizer_hook)
 
     # if training_args.gradient_checkpointing:
     #     model.enable_input_require_grads()

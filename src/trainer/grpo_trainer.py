@@ -1,6 +1,6 @@
 import os
 import sys
-sys.path.append("/dockerx/bangzhli/projects/LVR-Finetune")
+sys.path.append("/root/lvr")
 
 
 
@@ -14,6 +14,7 @@ import warnings
 import torch
 from torch import nn
 import datasets
+from functools import partial
 from typing import Union
 from collections import defaultdict, deque
 from collections.abc import Sized
@@ -23,11 +24,22 @@ from datasets import Dataset, IterableDataset
 from packaging import version
 import transformers
 import textwrap
+from transformers.utils import hub as transformers_hub
+
+try:
+    from huggingface_hub.constants import HF_HUB_CACHE
+except Exception:
+    HF_HUB_CACHE = None
+
+# Compatibility shim: llm_blender expects transformers.utils.hub.TRANSFORMERS_CACHE,
+# but this symbol was removed in newer transformers versions.
+if not hasattr(transformers_hub, "TRANSFORMERS_CACHE"):
+    transformers_hub.TRANSFORMERS_CACHE = HF_HUB_CACHE or os.path.expanduser("~/.cache/huggingface/hub")
 
 from torch.utils.data import DataLoader, Sampler
 
 from accelerate.utils import is_peft_model, set_seed, broadcast_object_list, gather, gather_object
-from transformers.utils import is_datasets_available
+from transformers.utils import is_datasets_available, is_rich_available
 
 from transformers.trainer import (
     TRAINER_STATE_NAME,
@@ -59,7 +71,7 @@ from trl.trainer.utils import selective_log_softmax
 from trl import GRPOTrainer
 from trl.trainer.grpo_config import GRPOConfig
 from trl.models import create_reference_model, prepare_deepspeed, unwrap_model_for_generation
-from trl.import_utils import is_deepspeed_available, is_liger_kernel_available, is_rich_available
+from trl.import_utils import is_deepspeed_available, is_liger_kernel_available
 from trl.trainer.callbacks import SyncRefModelCallback
 
 from trl.extras.profiling import profiling_decorator, profiling_context
@@ -582,7 +594,9 @@ class QwenGRPOTrainer(Trainer):
         if not isinstance(train_dataset, torch.utils.data.IterableDataset):
             dataloader_params["sampler"] = self._get_train_sampler()
             dataloader_params["drop_last"] = self.args.dataloader_drop_last
-            dataloader_params["worker_init_fn"] = seed_worker
+            dataloader_params["worker_init_fn"] = partial(
+                seed_worker, num_workers=self.args.dataloader_num_workers, rank=self.args.process_index
+            )
             dataloader_params["prefetch_factor"] = self.args.dataloader_prefetch_factor
 
         return self.accelerator.prepare(DataLoader(train_dataset, **dataloader_params))
@@ -716,6 +730,19 @@ class QwenGRPOTrainer(Trainer):
         prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
 
         image_inputs, video_inputs, video_kwargs = process_vision_info(prompts, return_video_kwargs=True)
+
+        # Newer HF validation expects `fps` to be int/float/None, not a list.
+        # qwen_vl_utils may return [] or [x], so normalize it before calling the processor.
+        if isinstance(video_kwargs, dict) and "fps" in video_kwargs:
+            fps = video_kwargs.get("fps")
+            if isinstance(fps, list):
+                if len(fps) == 0:
+                    video_kwargs.pop("fps", None)
+                elif len(fps) == 1:
+                    video_kwargs["fps"] = fps[0]
+                else:
+                    # For mixed/multi-video cases, let the processor fallback to its default FPS behavior.
+                    video_kwargs.pop("fps", None)
 
         prompt_inputs = self.processing_class(
             text = prompts_text,

@@ -24,8 +24,8 @@ from torch.nn import functional as F
 
 
 from transformers.generation.configuration_utils import (
-    NEED_SETUP_CACHE_CLASSES_MAPPING,
-    QUANT_BACKEND_CLASSES_MAPPING,
+    # NEED_SETUP_CACHE_CLASSES_MAPPING,
+    # QUANT_BACKEND_CLASSES_MAPPING,
     GenerationConfig,
     GenerationMode,
 )
@@ -58,6 +58,8 @@ from src.model.lvr_heads import LVRHead, LVRHeadGLU
 class QwenWithLVR(Qwen2_5_VLForConditionalGeneration):
     def __init__(self, config):
         super().__init__(config)
+        if not hasattr(self, "warnings_issued"):
+            self.warnings_issued = {}
         if config.lvr_head:
             self._init_lvr_head(config.lvr_head_type)
         if config.latent_end_token:
@@ -132,14 +134,35 @@ class QwenWithLVR(Qwen2_5_VLForConditionalGeneration):
 
         # 1. Handle `generation_config` and kwargs that might update it, and validate the `.generate()` call
         # self._validate_model_kwargs()
-        tokenizer = kwargs.pop("tokenizer", None)  # Pull this out first, we only use it for stopping criteria
-        assistant_tokenizer = kwargs.pop("assistant_tokenizer", None)  # only used for assisted generation
-
+        prepare_generation_kwargs = dict(kwargs)
+        if use_model_defaults is not None:
+            prepare_generation_kwargs["use_model_defaults"] = use_model_defaults
         generation_config, model_kwargs = self._prepare_generation_config(
-            generation_config, use_model_defaults, **kwargs
+            generation_config, **prepare_generation_kwargs
         )
+
+        forward_params = set(inspect.signature(self.forward).parameters.keys())
+        if "mm_token_type_ids" in model_kwargs and "mm_token_type_ids" not in forward_params:
+            # Some processor versions emit this key, while certain Qwen forward signatures don't accept it.
+            model_kwargs.pop("mm_token_type_ids", None)
+
         self._validate_model_kwargs(model_kwargs.copy())
-        self._validate_assistant(assistant_model, tokenizer, assistant_tokenizer)
+
+        generation_mode = generation_config.get_generation_mode(assistant_model)
+        generation_mode_kwargs = self._extract_generation_mode_kwargs(
+            custom_generate=None,
+            kwargs=kwargs,
+            synced_gpus=synced_gpus,
+            assistant_model=assistant_model,
+            streamer=streamer,
+        )
+        self._validate_generation_mode(generation_mode, generation_config, generation_mode_kwargs)
+
+        tokenizer = generation_mode_kwargs.get("tokenizer", None)
+        assistant_tokenizer = generation_mode_kwargs.get("assistant_tokenizer", None)
+        assistant_model = generation_mode_kwargs.get("assistant_model", assistant_model)
+        streamer = generation_mode_kwargs.get("streamer", streamer)
+        synced_gpus = generation_mode_kwargs.get("synced_gpus", synced_gpus)
 
         # 2. Set generation parameters if not already defined
         if synced_gpus is None:
@@ -248,7 +271,7 @@ class QwenWithLVR(Qwen2_5_VLForConditionalGeneration):
         ):
             max_cache_length += inputs_tensor.shape[1]
         self._prepare_cache_for_generation(
-            generation_config, model_kwargs, assistant_model, batch_size, max_cache_length, device
+            generation_config, model_kwargs, generation_mode, batch_size, max_cache_length
         )
 
         # 8. determine generation mode
@@ -283,7 +306,9 @@ class QwenWithLVR(Qwen2_5_VLForConditionalGeneration):
             negative_prompt_attention_mask=negative_prompt_attention_mask,
         )
         prepared_stopping_criteria = self._get_stopping_criteria(
-            generation_config=generation_config, stopping_criteria=stopping_criteria, tokenizer=tokenizer, **kwargs
+            generation_config=generation_config,
+            stopping_criteria=stopping_criteria,
+            tokenizer=tokenizer,
         )
 
         # Set model_kwargs `use_cache` so we can use it later in forward runs
@@ -427,9 +452,7 @@ class QwenWithLVR(Qwen2_5_VLForConditionalGeneration):
             this_peer_finished = False
             unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=input_ids.device)
             
-            # model_kwargs = self._get_initial_cache_position(cur_len, input_ids.device, model_kwargs)
-            # again Transformer version issue
-            model_kwargs = self._get_initial_cache_position(input_ids, model_kwargs)
+            model_kwargs = self._get_initial_cache_position(cur_len, input_ids.device, model_kwargs)
 
             model_forward = self.__call__
             if isinstance(model_kwargs.get("past_key_values"), Cache):
@@ -923,10 +946,7 @@ class QwenWithLVR(Qwen2_5_VLForConditionalGeneration):
         batch_size, cur_len = input_ids.shape
         this_peer_finished = False
         unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=input_ids.device)
-        try:
-            model_kwargs = self._get_initial_cache_position(cur_len, input_ids.device, model_kwargs)
-        except:
-            model_kwargs = self._get_initial_cache_position(input_ids, model_kwargs)
+        model_kwargs = self._get_initial_cache_position(cur_len, input_ids.device, model_kwargs)
 
         model_forward = self.__call__
         if isinstance(model_kwargs.get("past_key_values"), Cache):
