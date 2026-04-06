@@ -308,6 +308,7 @@ class QwenGRPOTrainer(Trainer):
         model_init_kwargs = args.model_init_kwargs or {}
 
         model_id = model.config._name_or_path
+        uses_qwen_lvr_arch = isinstance(model, QwenWithLVR)
         if args.model_init_kwargs is not None:
             raise ValueError(
                 "You passed `model_init_kwargs` to the `GRPOConfig`, but your model is already instantiated. "
@@ -330,7 +331,7 @@ class QwenGRPOTrainer(Trainer):
             # If beta is 0.0, the reference model is not needed
             self.ref_model = None    
         elif is_deepspeed_zero3_enabled():
-            if "Qwen2.5" in model_id:
+            if uses_qwen_lvr_arch:
                 # 1. forward func already patched
                 # 2. config
                 ref_model_config = AutoConfig.from_pretrained(self.ref_model_pth,trust_remote_code=True)

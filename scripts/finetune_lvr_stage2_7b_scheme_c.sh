@@ -1,10 +1,14 @@
 #!/bin/bash
 
+source /root/miniconda3/etc/profile.d/conda.sh
+conda activate train
+
 export PYTHONPATH=src:$PYTHONPATH
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
 MODEL_NAME="Qwen/Qwen2.5-VL-7B-Instruct"
 
-# STAGE1_STEPS=2500
+STAGE1_STEPS=2500
 # CHKPT_PATH="stage1_checkpoints/Qwen2.5-VL-7B-Instruct/Stage1_0.5TI_mseLVRLossLambda0.1-MaxVisToken5120-MinVisToken128/checkpoint-${STAGE1_STEPS}/"
 CHKPT_PATH="/root/autodl-fs/LVR-7B"
 # data configs
@@ -16,12 +20,12 @@ OUTPUT_DIR="stage2_checkpoints_39k_scheme_c/"
 FREEZE_VISION=True
 FREEZE_MERGER=True
 DECODING_STRATEGY="steps"
-LVR_STEPS=8
+LVR_STEPS=2
 LR=5e-6
 TEMP=0.9
 
 # RLVR objective scheme C configs
-BETA=0.02
+BETA=0.00
 SIGMA=7.2
 USE_BETA_HAT=False
 T_MAX=1024
@@ -33,7 +37,7 @@ RUN_NAME="Stage2_7B_schemeC_decodingBy${DECODING_STRATEGY}_max${LVR_STEPS}lvrSte
 
 deepspeed src/train/train_grpo.py \
     --run_name "$RUN_NAME" \
-    --deepspeed scripts/zero2.json \
+    --deepspeed scripts/zero3_memsave.json \
     --online_checkpoint True \
     --checkpoint_name $CHKPT_PATH \
     --model_id $MODEL_NAME \
@@ -51,14 +55,14 @@ deepspeed src/train/train_grpo.py \
     --use_beta_hat $USE_BETA_HAT \
     --t_max $T_MAX \
     --temperature $TEMP \
-    --num_train_epochs 2 \
-    --num_generations 8 \
-    --per_device_train_batch_size 4 \
-    --gradient_accumulation_steps 2 \
-    --max_completion_length 512 \
-    --max_prompt_length 4096 \
+    --num_train_epochs 1 \
+    --num_generations 2 \
+    --per_device_train_batch_size 1 \
+    --gradient_accumulation_steps 4 \
+    --max_completion_length 48 \
+    --max_prompt_length 512 \
     --image_min_pixels $((128 * 28 * 28)) \
-    --image_max_pixels $((2560 * 28 * 28)) \
+    --image_max_pixels $((256 * 28 * 28)) \
     --learning_rate $LR \
     --remove_unused_columns False \
     --weight_decay 0.1 \
@@ -72,6 +76,6 @@ deepspeed src/train/train_grpo.py \
     --save_strategy "steps" \
     --save_steps 100 \
     --save_total_limit 50 \
-    --dataloader_num_workers 8 \
+    --dataloader_num_workers 2 \
     --decoding_strategy $DECODING_STRATEGY \
     --lvr_steps $LVR_STEPS

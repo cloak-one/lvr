@@ -6,3 +6,4 @@ logs/
 src/stage2_checkpoints_39k_scheme_c/
 /wandb/
 /stage2_checkpoints_39k_scheme_c/
+condaenv.f93rti5q.requirements.txt
