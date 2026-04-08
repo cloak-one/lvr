@@ -252,7 +252,36 @@ def train():
     trainer.train()
 ```
 
-### B. LVR 分层优化器
+### B. GRPO 训练入口
+- 文件: `src/train/train_grpo.py`
+- 符号: `train`
+- 核心性: 负责 RL 阶段的模型加载、RL 专用 forward patch、reward 函数装载、数据模块构建与 `QwenGRPOTrainer` 启动。
+- 关键依赖: `replace_qwen2_5_with_mixed_modality_forward_lvr_rl`, `load_reward_funcs`, `QwenGRPOTrainer`
+
+```python
+def train():
+    parser = HfArgumentParser((ModelArguments, DataArguments, GRPOArguments))
+    model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+
+    replace_qwen2_5_with_mixed_modality_forward_lvr_rl()
+    model = QwenWithLVR.from_pretrained(model_pth, config=config, torch_dtype=compute_dtype, ...)
+    reward_funcs = load_reward_funcs("src.train.reward_funcs")
+    dataset_module = make_grpo_data_module(model_id=model_args.model_id, processor=processor, data_args=data_args)
+    trainer = QwenGRPOTrainer(
+        model=model,
+        ref_model_pth=model_pth,
+        train_dataset=dataset_module["train_dataset"],
+        eval_dataset=dataset_module["eval_dataset"],
+        reward_funcs=reward_funcs,
+        processing_class=processor,
+        args=training_args,
+        temp_folder=temp_folder,
+        oci_handler=oci_handler,
+    )
+    trainer.train()
+```
+
+### C. LVR 分层优化器
 - 文件: `src/trainer/lvr_trainer.py`
 - 符号: `QwenLVRSFTTrainer.create_optimizer`
 - 核心性: 把视觉塔、merger、lvr_head 与其余参数分组设置学习率，是训练稳定性的关键开关。
